@@ -166,9 +166,12 @@ class LiveTranslator:
         except asyncio.CancelledError:
             pass
         finally:
-            if self.audio_stream:
-                self.audio_stream.stop_stream()
-                self.audio_stream.close()
+            try:
+                if self.audio_stream:
+                    self.audio_stream.stop_stream()
+                    self.audio_stream.close()
+            except OSError:
+                pass
 
     async def output_to_blackhole(self, blackhole_index):
         """Write translated audio to BlackHole virtual device."""
@@ -187,9 +190,12 @@ class LiveTranslator:
         except asyncio.CancelledError:
             pass
         finally:
-            if stream:
-                stream.stop_stream()
-                stream.close()
+            try:
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+            except OSError:
+                pass
 
     async def monitor_audio(self):
         """Play translated audio to default speakers so user can hear it."""
@@ -211,9 +217,12 @@ class LiveTranslator:
         except asyncio.CancelledError:
             pass
         finally:
-            if stream:
-                stream.stop_stream()
-                stream.close()
+            try:
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+            except OSError:
+                pass
 
     async def monitor_mic_audio(self):
         """Play original mic audio to default speakers (--monitor-all)."""
@@ -235,9 +244,12 @@ class LiveTranslator:
         except asyncio.CancelledError:
             pass
         finally:
-            if stream:
-                stream.stop_stream()
-                stream.close()
+            try:
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+            except OSError:
+                pass
 
     async def mix_original_to_blackhole(self, blackhole_index):
         """In mix mode, also send original mic audio to BlackHole."""
@@ -256,9 +268,12 @@ class LiveTranslator:
         except asyncio.CancelledError:
             pass
         finally:
-            if stream:
-                stream.stop_stream()
-                stream.close()
+            try:
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+            except OSError:
+                pass
 
     async def receive_audio(self):
         """Receive translated audio from Gemini and route it."""
