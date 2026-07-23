@@ -79,6 +79,22 @@ def list_audio_devices():
     print()
 
 
+def _mix_audio(base, overlay, base_vol=1.0, overlay_vol=1.0):
+    """Mix two PCM16 buffers sample-by-sample with volume control. Clamps to int16 range."""
+    import struct
+    n_base = len(base) // 2
+    n_overlay = len(overlay) // 2
+    n = min(n_base, n_overlay)
+    base_samples = struct.unpack(f"<{n_base}h", base)
+    overlay_samples = struct.unpack(f"<{n_overlay}h", overlay)
+    mixed = []
+    for i in range(n):
+        val = int(base_samples[i] * base_vol + overlay_samples[i] * overlay_vol)
+        mixed.append(max(-32768, min(32767, val)))
+    for i in range(n, n_base):
+        mixed.append(int(base_samples[i] * base_vol))
+    return struct.pack(f"<{len(mixed)}h", *mixed)
+
 
 class LiveTranslator:
     VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Perseus"]
@@ -99,9 +115,9 @@ class LiveTranslator:
         self._loop = None
         self._blackhole_idx = None
 
-        self.blackhole_queue = None
         self.gemini_queue = None
         self.monitor_queue = None
+        self._translation_buffer = b''
 
     def _build_config(self):
         return types.LiveConnectConfig(
@@ -118,8 +134,8 @@ class LiveTranslator:
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
 
-    async def listen_audio(self):
-        """Capture mic audio and send to BlackHole queue + Gemini queue."""
+    async def listen_and_output(self):
+        """Capture mic, mix with translation, output to BlackHole. Mic drives the clock."""
         mic_info = pya.get_default_input_device_info()
         self.audio_stream = await asyncio.to_thread(
             pya.open,
@@ -131,36 +147,7 @@ class LiveTranslator:
             frames_per_buffer=CHUNK_SIZE,
         )
 
-        if __debug__:
-            kwargs = {"exception_on_overflow": False}
-        else:
-            kwargs = {}
-
-        try:
-            while self.running:
-                data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-                if self.mix or not self.translating:
-                    self.blackhole_queue.put_nowait(data)
-                if self.translating:
-                    payload = {"data": data, "mime_type": "audio/pcm;rate=24000"}
-                    try:
-                        self.gemini_queue.put_nowait(payload)
-                    except asyncio.QueueFull:
-                        _ = self.gemini_queue.get_nowait()
-                        self.gemini_queue.put_nowait(payload)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            try:
-                if self.audio_stream:
-                    self.audio_stream.stop_stream()
-                    self.audio_stream.close()
-            except OSError:
-                pass
-
-    async def write_to_blackhole(self):
-        """Single stream writing all audio (mic + translation) to BlackHole at 16kHz."""
-        stream = await asyncio.to_thread(
+        blackhole_stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
@@ -168,19 +155,72 @@ class LiveTranslator:
             output=True,
             output_device_index=self._blackhole_idx,
         )
+
+        if __debug__:
+            read_kwargs = {"exception_on_overflow": False}
+        else:
+            read_kwargs = {}
+
+        silence = b'\x00' * (CHUNK_SIZE * 2)
+
         try:
             while self.running:
-                data = await self.blackhole_queue.get()
-                await asyncio.to_thread(stream.write, data)
+                data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **read_kwargs)
+
+                # Send to Gemini when translating
+                if self.translating:
+                    payload = {"data": data, "mime_type": "audio/pcm;rate=24000"}
+                    try:
+                        self.gemini_queue.put_nowait(payload)
+                    except asyncio.QueueFull:
+                        _ = self.gemini_queue.get_nowait()
+                        self.gemini_queue.put_nowait(payload)
+
+                # Build output for BlackHole
+                # Drain available translation audio from buffer
+                translation_chunk = self._consume_translation_buffer(CHUNK_SIZE * 2)
+
+                if not self.translating:
+                    output = data
+                elif self.mix:
+                    if translation_chunk:
+                        output = _mix_audio(data, translation_chunk, base_vol=0.5, overlay_vol=0.8)
+                    else:
+                        output = data
+                else:
+                    if translation_chunk:
+                        output = translation_chunk
+                    else:
+                        output = silence
+
+                await asyncio.to_thread(blackhole_stream.write, output)
         except asyncio.CancelledError:
             pass
         finally:
             try:
-                if stream:
-                    stream.stop_stream()
-                    stream.close()
+                if self.audio_stream:
+                    self.audio_stream.stop_stream()
+                    self.audio_stream.close()
+                if blackhole_stream:
+                    blackhole_stream.stop_stream()
+                    blackhole_stream.close()
             except OSError:
                 pass
+
+    def _consume_translation_buffer(self, num_bytes):
+        """Take up to num_bytes from the translation buffer."""
+        if not self._translation_buffer:
+            return None
+        if len(self._translation_buffer) >= num_bytes:
+            chunk = self._translation_buffer[:num_bytes]
+            self._translation_buffer = self._translation_buffer[num_bytes:]
+            return chunk
+        else:
+            chunk = self._translation_buffer
+            self._translation_buffer = b''
+            # Pad with silence to match expected size
+            chunk += b'\x00' * (num_bytes - len(chunk))
+            return chunk
 
     async def monitor_audio(self):
         """Play translated audio to speakers so user can hear it."""
@@ -226,7 +266,7 @@ class LiveTranslator:
                     if server_content.model_turn:
                         for part in server_content.model_turn.parts:
                             if part.inline_data:
-                                self.blackhole_queue.put_nowait(part.inline_data.data)
+                                self._translation_buffer += part.inline_data.data
                                 if self.monitor:
                                     self.monitor_queue.put_nowait(part.inline_data.data)
 
@@ -283,7 +323,7 @@ class LiveTranslator:
         self.translating = True
         self._stop_event = asyncio.Event()
         self._loop = asyncio.get_event_loop()
-        self.blackhole_queue = asyncio.Queue()
+        self._translation_buffer = b''
         self.gemini_queue = asyncio.Queue(maxsize=5)
         self.monitor_queue = asyncio.Queue()
 
@@ -304,8 +344,7 @@ class LiveTranslator:
                 self.session = session
 
                 quit_task = tg.create_task(self.wait_for_quit())
-                tg.create_task(self.listen_audio())
-                tg.create_task(self.write_to_blackhole())
+                tg.create_task(self.listen_and_output())
                 tg.create_task(self.send_realtime())
                 tg.create_task(self.receive_audio())
 
@@ -336,7 +375,7 @@ class LiveTranslator:
         self.translating = False
         self._stop_event = asyncio.Event()
         self._loop = asyncio.get_event_loop()
-        self.blackhole_queue = asyncio.Queue()
+        self._translation_buffer = b''
         self.gemini_queue = asyncio.Queue(maxsize=5)
         self.monitor_queue = asyncio.Queue()
 
@@ -347,8 +386,7 @@ class LiveTranslator:
         try:
             async with asyncio.TaskGroup() as tg:
                 quit_task = tg.create_task(self.wait_for_quit())
-                tg.create_task(self.listen_audio())
-                tg.create_task(self.write_to_blackhole())
+                tg.create_task(self.listen_and_output())
 
                 await quit_task
                 raise asyncio.CancelledError("exit")
