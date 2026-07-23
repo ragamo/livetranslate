@@ -80,12 +80,13 @@ def list_audio_devices():
 
 
 class LiveTranslator:
-    def __init__(self, source_lang="es", target_lang="en", mix_mode=False, monitor=False, monitor_all=False):
+    def __init__(self, source_lang="es", target_lang="en", mix_mode=False, monitor=False, monitor_all=False, monitor_device_index=None):
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.mix_mode = mix_mode
         self.monitor = monitor or monitor_all
         self.monitor_all = monitor_all
+        self.monitor_device_index = monitor_device_index
 
         self.audio_in_queue = asyncio.Queue()
         self.out_queue = asyncio.Queue(maxsize=5)
@@ -196,12 +197,16 @@ class LiveTranslator:
 
     async def monitor_audio(self):
         """Play translated audio to default speakers so user can hear it."""
+        kwargs = {}
+        if self.monitor_device_index is not None:
+            kwargs["output_device_index"] = self.monitor_device_index
         stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
             rate=RECEIVE_SAMPLE_RATE,
             output=True,
+            **kwargs,
         )
         try:
             while self.running:
@@ -216,12 +221,16 @@ class LiveTranslator:
 
     async def monitor_mic_audio(self):
         """Play original mic audio to default speakers (--monitor-all)."""
+        kwargs = {}
+        if self.monitor_device_index is not None:
+            kwargs["output_device_index"] = self.monitor_device_index
         stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
             rate=SEND_SAMPLE_RATE,
             output=True,
+            **kwargs,
         )
         try:
             while self.running:
