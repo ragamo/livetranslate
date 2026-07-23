@@ -80,13 +80,16 @@ def list_audio_devices():
 
 
 class LiveTranslator:
-    def __init__(self, source_lang="es", target_lang="en", mix_mode=False, monitor=False, monitor_all=False, monitor_device_index=None):
+    VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Perseus"]
+
+    def __init__(self, source_lang="es", target_lang="en", mix_mode=False, monitor=False, monitor_all=False, monitor_device_index=None, voice="Zephyr"):
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.mix_mode = mix_mode
         self.monitor = monitor or monitor_all
         self.monitor_all = monitor_all
         self.monitor_device_index = monitor_device_index
+        self.voice = voice
 
         self.audio_in_queue = asyncio.Queue()
         self.out_queue = asyncio.Queue(maxsize=5)
@@ -120,7 +123,7 @@ class LiveTranslator:
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.voice)
                 )
             ),
             translation_config=types.TranslationConfig(
@@ -431,6 +434,11 @@ def main():
         help="Play both your original voice and translation on your speakers"
     )
     parser.add_argument(
+        "--voice", type=str, default="Zephyr",
+        choices=LiveTranslator.VOICES,
+        help="Voice for translation (default: Zephyr)"
+    )
+    parser.add_argument(
         "--list-devices", action="store_true",
         help="List available audio devices and exit"
     )
@@ -446,6 +454,7 @@ def main():
         mix_mode=args.mix,
         monitor=args.monitor,
         monitor_all=args.monitor_all,
+        voice=args.voice,
     )
 
     import threading

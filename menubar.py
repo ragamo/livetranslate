@@ -44,6 +44,7 @@ class LiveTranslateApp(rumps.App):
 
         self.source_lang = "es"
         self.target_lang = "en"
+        self.voice = "Zephyr"
         self.mix_mode = False
         self.monitor = False
         self.monitor_all = False
@@ -73,6 +74,12 @@ class LiveTranslateApp(rumps.App):
             item.state = code == self.target_lang
             self.target_menu.add(item)
 
+        self.voice_menu = rumps.MenuItem("Voice")
+        for v in LiveTranslator.VOICES:
+            item = rumps.MenuItem(v, callback=self.set_voice)
+            item.state = v == self.voice
+            self.voice_menu.add(item)
+
         self.output_menu = rumps.MenuItem("Output Device")
         self._populate_output_devices()
 
@@ -91,6 +98,7 @@ class LiveTranslateApp(rumps.App):
             None,
             self.source_menu,
             self.target_menu,
+            self.voice_menu,
             None,
             self.output_menu,
             self.mix_item,
@@ -116,6 +124,11 @@ class LiveTranslateApp(rumps.App):
 
     def refresh_devices(self, _):
         self._populate_output_devices()
+
+    def set_voice(self, sender):
+        self.voice = sender.title
+        for item in self.voice_menu.values():
+            item.state = item.title == sender.title
 
     def set_output_device(self, sender):
         if sender.title == "Default":
@@ -170,6 +183,7 @@ class LiveTranslateApp(rumps.App):
             monitor=self.monitor or self.monitor_all,
             monitor_all=self.monitor_all,
             monitor_device_index=self.monitor_device_index,
+            voice=self.voice,
         )
 
         def run_loop():
