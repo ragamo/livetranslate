@@ -46,8 +46,9 @@ if sys.version_info < (3, 11, 0):
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-SEND_SAMPLE_RATE = 24000
-RECEIVE_SAMPLE_RATE = 24000
+LOCAL_SAMPLE_RATE = 24000
+GEMINI_INPUT_RATE = 16000
+GEMINI_OUTPUT_RATE = 24000
 CHUNK_SIZE = 1024
 
 MODEL = "gemini-3.5-live-translate-preview"
@@ -78,6 +79,24 @@ def list_audio_devices():
         print(f"  [{i}] {info['name']} ({'/'.join(direction)})")
     print()
 
+
+def _downsample_24k_to_16k(data):
+    """Downsample PCM16 from 24kHz to 16kHz (ratio 3:2). Takes every 2 of 3 samples."""
+    import struct
+    samples = struct.unpack(f"<{len(data)//2}h", data)
+    # Linear interpolation: 24000/16000 = 3/2, output is 2/3 the length
+    out_len = len(samples) * 2 // 3
+    result = []
+    for i in range(out_len):
+        src = i * 1.5
+        idx = int(src)
+        frac = src - idx
+        if idx + 1 < len(samples):
+            val = int(samples[idx] * (1 - frac) + samples[idx + 1] * frac)
+        else:
+            val = samples[idx] if idx < len(samples) else 0
+        result.append(val)
+    return struct.pack(f"<{len(result)}h", *result)
 
 
 
@@ -126,7 +145,7 @@ class LiveTranslator:
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
-            rate=SEND_SAMPLE_RATE,
+            rate=LOCAL_SAMPLE_RATE,
             input=True,
             input_device_index=mic_info["index"],
             frames_per_buffer=CHUNK_SIZE,
@@ -136,7 +155,7 @@ class LiveTranslator:
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
-            rate=SEND_SAMPLE_RATE,
+            rate=LOCAL_SAMPLE_RATE,
             output=True,
             output_device_index=self._blackhole_idx,
         )
@@ -156,7 +175,8 @@ class LiveTranslator:
 
                 # Send to Gemini when translating
                 if self.translating:
-                    payload = {"data": data, "mime_type": "audio/pcm;rate=24000"}
+                    data_16k = _downsample_24k_to_16k(data)
+                    payload = {"data": data_16k, "mime_type": "audio/pcm;rate=16000"}
                     try:
                         self.gemini_queue.put_nowait(payload)
                     except asyncio.QueueFull:
@@ -176,12 +196,12 @@ class LiveTranslator:
                 pass
 
     async def play_translation_to_blackhole(self):
-        """Write translation audio to BlackHole via a second stream (same sample rate)."""
+        """Write translation audio to BlackHole at 24kHz (Gemini output rate)."""
         stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
-            rate=SEND_SAMPLE_RATE,
+            rate=LOCAL_SAMPLE_RATE,
             output=True,
             output_device_index=self._blackhole_idx,
         )
@@ -208,7 +228,7 @@ class LiveTranslator:
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
-            rate=RECEIVE_SAMPLE_RATE,
+            rate=LOCAL_SAMPLE_RATE,
             output=True,
             **kwargs,
         )
