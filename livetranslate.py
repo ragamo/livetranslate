@@ -95,6 +95,7 @@ class LiveTranslator:
         self.audio_stream = None
         self.running = False
         self.model_speaking = False
+        self._stop_event = None
 
     def _build_config(self):
         lang_names = {
@@ -309,16 +310,15 @@ class LiveTranslator:
         except asyncio.CancelledError:
             pass
 
+    def request_stop(self):
+        """Signal the translator to stop (thread-safe)."""
+        self.running = False
+        if self._stop_event and self._loop:
+            self._loop.call_soon_threadsafe(self._stop_event.set)
+
     async def wait_for_quit(self):
-        """Wait for user to press Enter or type 'q' to quit."""
-        try:
-            while self.running:
-                text = await asyncio.to_thread(input, "")
-                if text.lower() in ("q", "quit", "exit", ""):
-                    self.running = False
-                    break
-        except (asyncio.CancelledError, EOFError):
-            pass
+        """Wait for stop signal or user input 'q'."""
+        await self._stop_event.wait()
 
     async def run(self):
         """Main loop: connect to Gemini and run all audio tasks."""
@@ -340,6 +340,8 @@ class LiveTranslator:
         config = self._build_config()
 
         self.running = True
+        self._stop_event = asyncio.Event()
+        self._loop = asyncio.get_event_loop()
         self.audio_in_queue = asyncio.Queue()
         self.out_queue = asyncio.Queue(maxsize=5)
         self.monitor_queue = asyncio.Queue()
@@ -430,6 +432,21 @@ def main():
         monitor=args.monitor,
         monitor_all=args.monitor_all,
     )
+
+    import threading
+
+    def stdin_listener():
+        try:
+            while translator.running:
+                text = input("")
+                if text.lower() in ("q", "quit", "exit", ""):
+                    translator.request_stop()
+                    break
+        except EOFError:
+            translator.request_stop()
+
+    t = threading.Thread(target=stdin_listener, daemon=True)
+    t.start()
     asyncio.run(translator.run())
 
 

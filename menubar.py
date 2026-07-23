@@ -157,7 +157,7 @@ class LiveTranslateApp(rumps.App):
             self.monitor_item.state = False
 
     def toggle(self, sender):
-        if self.translator and self.translator.running:
+        if self.thread and self.thread.is_alive():
             self.stop_translation()
         else:
             self.start_translation()
@@ -173,10 +173,10 @@ class LiveTranslateApp(rumps.App):
         )
 
         def run_loop():
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            self.loop.run_until_complete(self.translator.run())
-            rumps.Timer(0, lambda _: self._on_stopped()).start()
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.translator.run())
+            loop.close()
 
         self.thread = threading.Thread(target=run_loop, daemon=True)
         self.thread.start()
@@ -187,7 +187,11 @@ class LiveTranslateApp(rumps.App):
 
     def stop_translation(self):
         if self.translator:
-            self.translator.running = False
+            self.translator.request_stop()
+        if self.thread:
+            self.thread.join(timeout=5)
+            self.thread = None
+        self.translator = None
         self._on_stopped()
 
     def _on_stopped(self):
