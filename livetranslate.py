@@ -1,8 +1,8 @@
 """
 LiveTranslate - Real-time audio translation for Google Meet
 
-Captures your microphone, translates speech via Gemini Live API,
-and outputs translated audio to a virtual device (BlackHole).
+Captures your microphone and forwards it to BlackHole virtual device.
+When translation is active, also sends translated audio to BlackHole.
 
 ## Setup
 
@@ -10,16 +10,16 @@ and outputs translated audio to a virtual device (BlackHole).
    brew install blackhole-2ch
 
 2. Install Python dependencies:
-   pip install -r requirements.txt
+   pip3 install -r requirements.txt
 
-3. Set your Google API key:
-   export GOOGLE_API_KEY="your-key-here"
+3. Set your Google API key in .env:
+   GEMINI_API_KEY="your-key-here"
 
 ## Usage
 
-   python livetranslate.py                    # Spanish → English, translation only
-   python livetranslate.py --mix              # Mix original + translation
+   python livetranslate.py                    # Spanish → English
    python livetranslate.py --from en --to es  # English → Spanish
+   python livetranslate.py --monitor          # Hear translation in your speakers
 
 In Google Meet: select "BlackHole 2ch" as your microphone input.
 """
@@ -46,7 +46,7 @@ if sys.version_info < (3, 11, 0):
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-SEND_SAMPLE_RATE = 16000
+SEND_SAMPLE_RATE = 24000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
@@ -79,46 +79,30 @@ def list_audio_devices():
     print()
 
 
+
 class LiveTranslator:
     VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Perseus"]
 
-    def __init__(self, source_lang="es", target_lang="en", mix_mode=False, monitor=False, monitor_all=False, monitor_device_index=None, voice="Zephyr"):
+    def __init__(self, source_lang="es", target_lang="en", monitor=False, monitor_device_index=None, voice="Zephyr"):
         self.source_lang = source_lang
         self.target_lang = target_lang
-        self.mix_mode = mix_mode
-        self.monitor = monitor or monitor_all
-        self.monitor_all = monitor_all
+        self.monitor = monitor
         self.monitor_device_index = monitor_device_index
         self.voice = voice
-
-        self.audio_in_queue = asyncio.Queue()
-        self.out_queue = asyncio.Queue(maxsize=5)
 
         self.session = None
         self.audio_stream = None
         self.running = False
-        self.model_speaking = False
+        self.translating = False
         self._stop_event = None
+        self._loop = None
+        self._blackhole_idx = None
+
+        self.blackhole_queue = None
+        self.gemini_queue = None
+        self.monitor_queue = None
 
     def _build_config(self):
-        lang_names = {
-            "es": "Spanish", "en": "English", "fr": "French",
-            "de": "German", "pt": "Portuguese", "it": "Italian",
-            "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
-            "ru": "Russian", "ar": "Arabic",
-        }
-        src = lang_names.get(self.source_lang, self.source_lang)
-        tgt = lang_names.get(self.target_lang, self.target_lang)
-
-        system_instruction = (
-            f"You are a simultaneous interpreter. Translate speech from {src} to {tgt} "
-            f"in real-time, starting to translate as soon as you understand the meaning — "
-            f"do NOT wait for the speaker to finish. Speak ONLY the translation. "
-            f"Do not add commentary, do not repeat the original, do not explain. "
-            f"Translate naturally and fluently, keeping up with the speaker's pace. "
-            f"If you hear silence or non-speech sounds, remain silent."
-        )
-
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
@@ -134,7 +118,7 @@ class LiveTranslator:
         )
 
     async def listen_audio(self):
-        """Capture microphone audio and queue it for sending."""
+        """Capture mic audio and send to BlackHole queue + Gemini queue."""
         mic_info = pya.get_default_input_device_info()
         self.audio_stream = await asyncio.to_thread(
             pya.open,
@@ -154,18 +138,14 @@ class LiveTranslator:
         try:
             while self.running:
                 data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-                if self.monitor_all:
+                self.blackhole_queue.put_nowait(data)
+                if self.translating:
+                    payload = {"data": data, "mime_type": "audio/pcm;rate=24000"}
                     try:
-                        self.monitor_mic_queue.put_nowait(data)
+                        self.gemini_queue.put_nowait(payload)
                     except asyncio.QueueFull:
-                        _ = self.monitor_mic_queue.get_nowait()
-                        self.monitor_mic_queue.put_nowait(data)
-                payload = {"data": data, "mime_type": "audio/pcm;rate=16000"}
-                try:
-                    self.out_queue.put_nowait(payload)
-                except asyncio.QueueFull:
-                    _ = self.out_queue.get_nowait()
-                    self.out_queue.put_nowait(payload)
+                        _ = self.gemini_queue.get_nowait()
+                        self.gemini_queue.put_nowait(payload)
         except asyncio.CancelledError:
             pass
         finally:
@@ -176,20 +156,20 @@ class LiveTranslator:
             except OSError:
                 pass
 
-    async def output_to_blackhole(self, blackhole_index):
-        """Write translated audio to BlackHole virtual device."""
+    async def write_to_blackhole(self):
+        """Single stream writing all audio (mic + translation) to BlackHole at 16kHz."""
         stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
             channels=CHANNELS,
-            rate=RECEIVE_SAMPLE_RATE,
+            rate=SEND_SAMPLE_RATE,
             output=True,
-            output_device_index=blackhole_index,
+            output_device_index=self._blackhole_idx,
         )
         try:
             while self.running:
-                bytestream = await self.audio_in_queue.get()
-                await asyncio.to_thread(stream.write, bytestream)
+                data = await self.blackhole_queue.get()
+                await asyncio.to_thread(stream.write, data)
         except asyncio.CancelledError:
             pass
         finally:
@@ -201,7 +181,7 @@ class LiveTranslator:
                 pass
 
     async def monitor_audio(self):
-        """Play translated audio to default speakers so user can hear it."""
+        """Play translated audio to speakers so user can hear it."""
         kwargs = {}
         if self.monitor_device_index is not None:
             kwargs["output_device_index"] = self.monitor_device_index
@@ -227,81 +207,26 @@ class LiveTranslator:
             except OSError:
                 pass
 
-    async def monitor_mic_audio(self):
-        """Play original mic audio to default speakers (--monitor-all)."""
-        kwargs = {}
-        if self.monitor_device_index is not None:
-            kwargs["output_device_index"] = self.monitor_device_index
-        stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=SEND_SAMPLE_RATE,
-            output=True,
-            **kwargs,
-        )
-        try:
-            while self.running:
-                bytestream = await self.monitor_mic_queue.get()
-                await asyncio.to_thread(stream.write, bytestream)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            try:
-                if stream:
-                    stream.stop_stream()
-                    stream.close()
-            except OSError:
-                pass
-
-    async def mix_original_to_blackhole(self, blackhole_index):
-        """In mix mode, also send original mic audio to BlackHole."""
-        stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=SEND_SAMPLE_RATE,
-            output=True,
-            output_device_index=blackhole_index,
-        )
-        try:
-            while self.running:
-                data = await self.mix_queue.get()
-                await asyncio.to_thread(stream.write, data)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            try:
-                if stream:
-                    stream.stop_stream()
-                    stream.close()
-            except OSError:
-                pass
-
     async def receive_audio(self):
-        """Receive translated audio from Gemini and route it."""
+        """Receive translated audio from Gemini, resample, and route."""
         try:
-            while self.running:
+            while self.translating:
                 async for response in self.session.receive():
+                    if not self.translating:
+                        break
                     server_content = response.server_content
                     if server_content is None:
                         continue
 
                     if server_content.interrupted:
-                        self.model_speaking = False
-                        while not self.audio_in_queue.empty():
-                            self.audio_in_queue.get_nowait()
+                        pass
 
                     if server_content.model_turn:
-                        self.model_speaking = True
                         for part in server_content.model_turn.parts:
                             if part.inline_data:
-                                self.audio_in_queue.put_nowait(part.inline_data.data)
+                                self.blackhole_queue.put_nowait(part.inline_data.data)
                                 if self.monitor:
                                     self.monitor_queue.put_nowait(part.inline_data.data)
-
-                    if server_content.turn_complete:
-                        self.model_speaking = False
 
                     if server_content.input_transcription:
                         print(f"\r[YOU] {server_content.input_transcription.text}", end="", flush=True)
@@ -312,39 +237,33 @@ class LiveTranslator:
             pass
 
     async def send_realtime(self):
-        """Send queued audio/video to the Gemini session."""
+        """Send queued audio to the Gemini session."""
         try:
-            while self.running:
-                msg = await self.out_queue.get()
-                blob = types.Blob(data=msg["data"], mime_type=msg["mime_type"])
-                await self.session.send_realtime_input(audio=blob)
-
-                if self.mix_mode:
-                    try:
-                        self.mix_queue.put_nowait(msg["data"])
-                    except asyncio.QueueFull:
-                        _ = self.mix_queue.get_nowait()
-                        self.mix_queue.put_nowait(msg["data"])
+            while self.translating:
+                msg = await self.gemini_queue.get()
+                if self.translating and self.session:
+                    blob = types.Blob(data=msg["data"], mime_type=msg["mime_type"])
+                    await self.session.send_realtime_input(audio=blob)
         except asyncio.CancelledError:
             pass
 
     def request_stop(self):
-        """Signal the translator to stop (thread-safe)."""
+        """Signal the app to stop completely (thread-safe)."""
         self.running = False
+        self.translating = False
         if self._stop_event and self._loop:
             self._loop.call_soon_threadsafe(self._stop_event.set)
 
     async def wait_for_quit(self):
-        """Wait for stop signal or user input 'q'."""
+        """Wait for stop signal."""
         await self._stop_event.wait()
 
     async def run(self):
-        """Main loop: connect to Gemini and run all audio tasks."""
+        """CLI mode: forward mic to BlackHole + translate immediately."""
         blackhole_idx, blackhole_name = find_blackhole_device()
         if blackhole_idx is None:
             print("ERROR: BlackHole audio device not found.")
             print("Install it with: brew install blackhole-2ch")
-            print("\nAlternatively, available devices:")
             list_audio_devices()
             return
 
@@ -354,25 +273,25 @@ class LiveTranslator:
             print("Get a key from https://aistudio.google.com/apikey")
             return
 
+        self._blackhole_idx = blackhole_idx
         client = genai.Client(api_key=api_key)
         config = self._build_config()
 
         self.running = True
+        self.translating = True
         self._stop_event = asyncio.Event()
         self._loop = asyncio.get_event_loop()
-        self.audio_in_queue = asyncio.Queue()
-        self.out_queue = asyncio.Queue(maxsize=5)
+        self.blackhole_queue = asyncio.Queue()
+        self.gemini_queue = asyncio.Queue(maxsize=5)
         self.monitor_queue = asyncio.Queue()
-        self.monitor_mic_queue = asyncio.Queue(maxsize=5)
-        self.mix_queue = asyncio.Queue(maxsize=5)
 
         print(f"LiveTranslate")
         print(f"  Translation: {self.source_lang} -> {self.target_lang}")
-        print(f"  Mode: {'mix (original + translation)' if self.mix_mode else 'translation only'}")
+        print(f"  Voice: {self.voice}")
         print(f"  Output device: {blackhole_name} [index {blackhole_idx}]")
-        monitor_status = "all (voice + translation)" if self.monitor_all else ("translation only" if self.monitor else "off")
-        print(f"  Monitor (speakers): {monitor_status}")
-        print(f"\n  In Google Meet, select '{blackhole_name}' as your microphone.")
+        print(f"  Monitor (speakers): {'on' if self.monitor else 'off'}")
+        print(f"\n  Mic -> BlackHole: always active")
+        print(f"  In Google Meet, select '{blackhole_name}' as your microphone.")
         print(f"\n  Press Enter or type 'q' to stop.\n")
 
         try:
@@ -383,19 +302,13 @@ class LiveTranslator:
                 self.session = session
 
                 quit_task = tg.create_task(self.wait_for_quit())
-                tg.create_task(self.send_realtime())
                 tg.create_task(self.listen_audio())
+                tg.create_task(self.write_to_blackhole())
+                tg.create_task(self.send_realtime())
                 tg.create_task(self.receive_audio())
-                tg.create_task(self.output_to_blackhole(blackhole_idx))
-
-                if self.mix_mode:
-                    tg.create_task(self.mix_original_to_blackhole(blackhole_idx))
 
                 if self.monitor:
                     tg.create_task(self.monitor_audio())
-
-                if self.monitor_all:
-                    tg.create_task(self.monitor_mic_audio())
 
                 await quit_task
                 raise asyncio.CancelledError("User requested exit")
@@ -406,7 +319,87 @@ class LiveTranslator:
             traceback.print_exception(EG)
         finally:
             self.running = False
+            self.translating = False
             print("\nStopped.")
+
+    async def run_forward_only(self):
+        """Menubar mode: forward mic to BlackHole, translation controlled separately."""
+        blackhole_idx, blackhole_name = find_blackhole_device()
+        if blackhole_idx is None:
+            print("ERROR: BlackHole audio device not found.")
+            return
+
+        self._blackhole_idx = blackhole_idx
+        self.running = True
+        self.translating = False
+        self._stop_event = asyncio.Event()
+        self._loop = asyncio.get_event_loop()
+        self.blackhole_queue = asyncio.Queue()
+        self.gemini_queue = asyncio.Queue(maxsize=5)
+        self.monitor_queue = asyncio.Queue()
+
+        print(f"LiveTranslate (forwarding only)")
+        print(f"  Mic -> {blackhole_name}: active")
+        print(f"  Translation: off (use Start to begin)")
+
+        try:
+            async with asyncio.TaskGroup() as tg:
+                quit_task = tg.create_task(self.wait_for_quit())
+                tg.create_task(self.listen_audio())
+                tg.create_task(self.write_to_blackhole())
+
+                await quit_task
+                raise asyncio.CancelledError("exit")
+        except asyncio.CancelledError:
+            pass
+        except ExceptionGroup as EG:
+            traceback.print_exception(EG)
+        finally:
+            self.running = False
+            print("\nStopped.")
+
+    async def start_translation(self):
+        """Start the Gemini translation session (called while forwarding is active)."""
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            return
+
+        client = genai.Client(api_key=api_key)
+        config = self._build_config()
+
+        self._translate_stop = asyncio.Event()
+
+        try:
+            async with client.aio.live.connect(model=MODEL, config=config) as session:
+                self.session = session
+                self.translating = True
+                print(f"\n  Translation started: {self.source_lang} -> {self.target_lang}")
+
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self.send_realtime())
+                    tg.create_task(self.receive_audio())
+
+                    if self.monitor:
+                        tg.create_task(self.monitor_audio())
+
+                    await self._translate_stop.wait()
+                    raise asyncio.CancelledError("translation stopped")
+
+        except asyncio.CancelledError:
+            pass
+        except ExceptionGroup as EG:
+            traceback.print_exception(EG)
+        finally:
+            self.translating = False
+            self.session = None
+            print("\n  Translation stopped.")
+
+    def stop_translation(self):
+        """Stop only the translation, keep forwarding."""
+        self.translating = False
+        if hasattr(self, '_translate_stop') and self._translate_stop:
+            if self._loop:
+                self._loop.call_soon_threadsafe(self._translate_stop.set)
 
 
 def main():
@@ -422,16 +415,8 @@ def main():
         help="Target language code (default: en)"
     )
     parser.add_argument(
-        "--mix", action="store_true",
-        help="Mix original audio with translation (both go to virtual device)"
-    )
-    parser.add_argument(
         "--monitor", action="store_true",
         help="Also play translated audio on your speakers (so you can hear it)"
-    )
-    parser.add_argument(
-        "--monitor-all", action="store_true",
-        help="Play both your original voice and translation on your speakers"
     )
     parser.add_argument(
         "--voice", type=str, default="Zephyr",
@@ -451,9 +436,7 @@ def main():
     translator = LiveTranslator(
         source_lang=args.source_lang,
         target_lang=args.target_lang,
-        mix_mode=args.mix,
         monitor=args.monitor,
-        monitor_all=args.monitor_all,
         voice=args.voice,
     )
 

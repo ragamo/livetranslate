@@ -3,6 +3,8 @@ LiveTranslate Menu Bar App
 
 System tray interface for LiveTranslate.
 Run with: python3 menubar.py
+
+Mic -> BlackHole is always active. Start/Stop controls translation only.
 """
 
 import asyncio
@@ -11,7 +13,7 @@ import threading
 import pyaudio
 import rumps
 
-from livetranslate import LiveTranslator
+from livetranslate import LiveTranslator, find_blackhole_device
 
 LANGUAGES = {
     "Spanish": "es",
@@ -45,21 +47,20 @@ class LiveTranslateApp(rumps.App):
         self.source_lang = "es"
         self.target_lang = "en"
         self.voice = "Zephyr"
-        self.mix_mode = False
         self.monitor = False
-        self.monitor_all = False
         self.monitor_device_index = None
         self.monitor_device_name = "Default"
 
         self.translator = None
-        self.loop = None
-        self.thread = None
+        self.forward_thread = None
+        self.forward_loop = None
 
         self._build_menu()
+        self._start_forwarding()
 
     def _build_menu(self):
-        self.start_stop = rumps.MenuItem("Start", callback=self.toggle)
-        self.status_item = rumps.MenuItem("Idle", callback=None)
+        self.start_stop = rumps.MenuItem("Start Translation", callback=self.toggle_translation)
+        self.status_item = rumps.MenuItem("Forwarding mic -> BlackHole", callback=None)
         self.status_item.set_callback(None)
 
         self.source_menu = rumps.MenuItem("From")
@@ -83,14 +84,8 @@ class LiveTranslateApp(rumps.App):
         self.output_menu = rumps.MenuItem("Output Device")
         self._populate_output_devices()
 
-        self.mix_item = rumps.MenuItem("Mix (voice + translation)", callback=self.toggle_mix)
-        self.mix_item.state = self.mix_mode
-
-        self.monitor_item = rumps.MenuItem("Monitor (translation)", callback=self.toggle_monitor)
+        self.monitor_item = rumps.MenuItem("Monitor (hear translation)", callback=self.toggle_monitor)
         self.monitor_item.state = self.monitor
-
-        self.monitor_all_item = rumps.MenuItem("Monitor All (voice + translation)", callback=self.toggle_monitor_all)
-        self.monitor_all_item.state = self.monitor_all
 
         self.menu = [
             self.start_stop,
@@ -101,9 +96,7 @@ class LiveTranslateApp(rumps.App):
             self.voice_menu,
             None,
             self.output_menu,
-            self.mix_item,
             self.monitor_item,
-            self.monitor_all_item,
             None,
             rumps.MenuItem("Refresh Devices", callback=self.refresh_devices),
             rumps.MenuItem("Quit", callback=self.quit_app),
@@ -151,70 +144,73 @@ class LiveTranslateApp(rumps.App):
         for item in self.target_menu.values():
             item.state = item.title == sender.title
 
-    def toggle_mix(self, sender):
-        self.mix_mode = not self.mix_mode
-        sender.state = self.mix_mode
-
     def toggle_monitor(self, sender):
         self.monitor = not self.monitor
         sender.state = self.monitor
-        if self.monitor:
-            self.monitor_all = False
-            self.monitor_all_item.state = False
 
-    def toggle_monitor_all(self, sender):
-        self.monitor_all = not self.monitor_all
-        sender.state = self.monitor_all
-        if self.monitor_all:
-            self.monitor = False
-            self.monitor_item.state = False
-
-    def toggle(self, sender):
-        if self.thread and self.thread.is_alive():
-            self.stop_translation()
-        else:
-            self.start_translation()
-
-    def start_translation(self):
+    def _start_forwarding(self):
+        """Start mic -> BlackHole forwarding on app launch."""
         self.translator = LiveTranslator(
             source_lang=self.source_lang,
             target_lang=self.target_lang,
-            mix_mode=self.mix_mode,
-            monitor=self.monitor or self.monitor_all,
-            monitor_all=self.monitor_all,
+            monitor=self.monitor,
             monitor_device_index=self.monitor_device_index,
             voice=self.voice,
         )
 
-        def run_loop():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.translator.run())
-            loop.close()
+        blackhole_idx, blackhole_name = find_blackhole_device()
+        if blackhole_idx is None:
+            self.status_item.title = "ERROR: BlackHole not found"
+            return
 
-        self.thread = threading.Thread(target=run_loop, daemon=True)
-        self.thread.start()
+        self.translator._blackhole_idx = blackhole_idx
 
-        self.title = "LT"
-        self.start_stop.title = "Stop"
-        self.status_item.title = f"{self.source_lang}->{self.target_lang} | {self.monitor_device_name}"
+        def run_forward():
+            self.forward_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.forward_loop)
+            self.forward_loop.run_until_complete(self.translator.run_forward_only())
+            self.forward_loop.close()
 
-    def stop_translation(self):
+        self.forward_thread = threading.Thread(target=run_forward, daemon=True)
+        self.forward_thread.start()
+        self.status_item.title = f"Mic -> {blackhole_name} (active)"
+
+    def toggle_translation(self, sender):
+        if self.translator and self.translator.translating:
+            self._stop_translation()
+        else:
+            self._start_translation()
+
+    def _start_translation(self):
+        """Start Gemini translation session in the forwarding event loop."""
+        self.translator.source_lang = self.source_lang
+        self.translator.target_lang = self.target_lang
+        self.translator.monitor = self.monitor
+        self.translator.monitor_device_index = self.monitor_device_index
+        self.translator.voice = self.voice
+
+        if self.forward_loop:
+            self.forward_loop.call_soon_threadsafe(
+                lambda: self.forward_loop.create_task(self.translator.start_translation())
+            )
+
+        self.start_stop.title = "Stop Translation"
+        self.status_item.title = f"Translating: {self.source_lang} -> {self.target_lang}"
+
+    def _stop_translation(self):
+        """Stop translation, keep forwarding."""
         if self.translator:
-            self.translator.request_stop()
-        if self.thread:
-            self.thread.join(timeout=5)
-            self.thread = None
-        self.translator = None
-        self._on_stopped()
+            self.translator.stop_translation()
 
-    def _on_stopped(self):
-        self.title = "LT"
-        self.start_stop.title = "Start"
-        self.status_item.title = "Idle"
+        self.start_stop.title = "Start Translation"
+        blackhole_idx, blackhole_name = find_blackhole_device()
+        self.status_item.title = f"Mic -> {blackhole_name or 'BlackHole'} (active)"
 
     def quit_app(self, _):
-        self.stop_translation()
+        if self.translator:
+            self.translator.request_stop()
+        if self.forward_thread:
+            self.forward_thread.join(timeout=3)
         rumps.quit_application()
 
 
