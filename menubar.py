@@ -10,7 +10,7 @@ Mic -> BlackHole is always active. Start/Stop controls translation only.
 import asyncio
 import threading
 
-import pyaudio
+import sounddevice as sd
 import rumps
 
 from livetranslate import LiveTranslator, find_blackhole_device
@@ -30,13 +30,10 @@ LANGUAGES = {
 
 def get_output_devices():
     """Return list of (index, name) for output-capable devices."""
-    p = pyaudio.PyAudio()
     devices = []
-    for i in range(p.get_device_count()):
-        info = p.get_device_info_by_index(i)
-        if info["maxOutputChannels"] > 0 and "blackhole" not in info["name"].lower():
-            devices.append((i, info["name"]))
-    p.terminate()
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_output_channels"] > 0 and "blackhole" not in d["name"].lower():
+            devices.append((i, d["name"]))
     return devices
 
 

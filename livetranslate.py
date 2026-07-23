@@ -26,11 +26,14 @@ In Google Meet: select "BlackHole 2ch" as your microphone input.
 
 import asyncio
 import argparse
+import collections
 import os
 import sys
 import traceback
+import threading
 
-import pyaudio
+import numpy as np
+import sounddevice as sd
 from dotenv import load_dotenv
 
 from google import genai
@@ -44,24 +47,20 @@ if sys.version_info < (3, 11, 0):
     asyncio.TaskGroup = taskgroup.TaskGroup
     asyncio.ExceptionGroup = exceptiongroup.ExceptionGroup
 
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-LOCAL_SAMPLE_RATE = 24000
+SAMPLE_RATE = 48000
 GEMINI_INPUT_RATE = 16000
 GEMINI_OUTPUT_RATE = 24000
-CHUNK_SIZE = 1024
+BLOCK_SIZE = 1024
 
 MODEL = "gemini-3.5-live-translate-preview"
-
-pya = pyaudio.PyAudio()
 
 
 def find_blackhole_device():
     """Find BlackHole virtual audio device index."""
-    for i in range(pya.get_device_count()):
-        info = pya.get_device_info_by_index(i)
-        if "blackhole" in info["name"].lower() and info["maxOutputChannels"] > 0:
-            return i, info["name"]
+    devices = sd.query_devices()
+    for i, d in enumerate(devices):
+        if "blackhole" in d["name"].lower() and d["max_output_channels"] > 0:
+            return i, d["name"]
     return None, None
 
 
@@ -69,35 +68,28 @@ def list_audio_devices():
     """List all available audio devices."""
     print("\nAvailable audio devices:")
     print("-" * 60)
-    for i in range(pya.get_device_count()):
-        info = pya.get_device_info_by_index(i)
+    devices = sd.query_devices()
+    for i, d in enumerate(devices):
         direction = []
-        if info["maxInputChannels"] > 0:
+        if d["max_input_channels"] > 0:
             direction.append("IN")
-        if info["maxOutputChannels"] > 0:
+        if d["max_output_channels"] > 0:
             direction.append("OUT")
-        print(f"  [{i}] {info['name']} ({'/'.join(direction)})")
+        print(f"  [{i}] {d['name']} ({'/'.join(direction)})")
     print()
 
 
-def _downsample_24k_to_16k(data):
-    """Downsample PCM16 from 24kHz to 16kHz (ratio 3:2). Takes every 2 of 3 samples."""
-    import struct
-    samples = struct.unpack(f"<{len(data)//2}h", data)
-    # Linear interpolation: 24000/16000 = 3/2, output is 2/3 the length
-    out_len = len(samples) * 2 // 3
-    result = []
-    for i in range(out_len):
-        src = i * 1.5
-        idx = int(src)
-        frac = src - idx
-        if idx + 1 < len(samples):
-            val = int(samples[idx] * (1 - frac) + samples[idx + 1] * frac)
-        else:
-            val = samples[idx] if idx < len(samples) else 0
-        result.append(val)
-    return struct.pack(f"<{len(result)}h", *result)
-
+def _resample(data_np, from_rate, to_rate):
+    """Resample numpy float32 audio array between sample rates."""
+    if from_rate == to_rate:
+        return data_np
+    ratio = to_rate / from_rate
+    n_out = int(len(data_np) * ratio)
+    indices = np.arange(n_out) / ratio
+    idx = indices.astype(int)
+    frac = indices - idx
+    idx = np.clip(idx, 0, len(data_np) - 2)
+    return data_np[idx] * (1 - frac) + data_np[idx + 1] * frac
 
 
 class LiveTranslator:
@@ -112,7 +104,6 @@ class LiveTranslator:
         self.voice = voice
 
         self.session = None
-        self.audio_stream = None
         self.running = False
         self.translating = False
         self._stop_event = None
@@ -120,8 +111,10 @@ class LiveTranslator:
         self._blackhole_idx = None
 
         self.gemini_queue = None
-        self.translation_queue = None
         self.monitor_queue = None
+        self._translation_buffer = np.array([], dtype=np.float32)
+        self._buf_lock = threading.Lock()
+        self._mic_buffer = collections.deque(maxlen=50)
 
     def _build_config(self):
         return types.LiveConnectConfig(
@@ -138,116 +131,91 @@ class LiveTranslator:
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
 
-    async def listen_and_forward(self):
-        """Capture mic, forward to BlackHole and Gemini."""
-        mic_info = pya.get_default_input_device_info()
-        self.audio_stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=LOCAL_SAMPLE_RATE,
-            input=True,
-            input_device_index=mic_info["index"],
-            frames_per_buffer=CHUNK_SIZE,
-        )
+    def _audio_callback(self, indata, outdata, frames, time, status):
+        """sounddevice callback: fast, no heavy processing."""
+        mic = indata[:, 0].copy()
 
-        blackhole_stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=LOCAL_SAMPLE_RATE,
-            output=True,
-            output_device_index=self._blackhole_idx,
-        )
+        # Buffer mic for async Gemini sender
+        if self.translating:
+            self._mic_buffer.append(mic.copy())
 
-        if __debug__:
-            read_kwargs = {"exception_on_overflow": False}
+        # Build output for BlackHole
+        with self._buf_lock:
+            available = len(self._translation_buffer)
+            if available > 0:
+                take = min(available, frames)
+                chunk = self._translation_buffer[:take]
+                self._translation_buffer = self._translation_buffer[take:]
+                if take < frames:
+                    translation = np.zeros(frames, dtype=np.float32)
+                    translation[:take] = chunk
+                else:
+                    translation = chunk
+            else:
+                translation = None
+
+        if not self.translating:
+            outdata[:, 0] = mic
+        elif self.mix:
+            if translation is not None:
+                outdata[:, 0] = mic * 0.5 + translation * 0.7
+            else:
+                outdata[:, 0] = mic
         else:
-            read_kwargs = {}
+            if translation is not None:
+                outdata[:, 0] = translation
+            else:
+                outdata[:, 0] = 0.0
 
+    async def capture_and_send(self):
+        """Read mic buffer, resample to 16kHz, send to Gemini."""
         try:
-            while self.running:
-                data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **read_kwargs)
-
-                # Forward mic to BlackHole (unless translating without mix)
-                if self.mix or not self.translating:
-                    await asyncio.to_thread(blackhole_stream.write, data)
-
-                # Send to Gemini when translating
-                if self.translating:
-                    data_16k = _downsample_24k_to_16k(data)
-                    payload = {"data": data_16k, "mime_type": "audio/pcm;rate=16000"}
+            while self.translating:
+                if self._mic_buffer:
+                    mic_48k = self._mic_buffer.popleft()
+                    mic_16k = _resample(mic_48k, SAMPLE_RATE, GEMINI_INPUT_RATE)
+                    pcm_bytes = (mic_16k * 32767).astype(np.int16).tobytes()
+                    payload = {"data": pcm_bytes, "mime_type": "audio/pcm;rate=16000"}
                     try:
                         self.gemini_queue.put_nowait(payload)
                     except asyncio.QueueFull:
-                        _ = self.gemini_queue.get_nowait()
+                        self.gemini_queue.get_nowait()
                         self.gemini_queue.put_nowait(payload)
+                else:
+                    await asyncio.sleep(0.01)
         except asyncio.CancelledError:
             pass
-        finally:
-            try:
-                if self.audio_stream:
-                    self.audio_stream.stop_stream()
-                    self.audio_stream.close()
-                if blackhole_stream:
-                    blackhole_stream.stop_stream()
-                    blackhole_stream.close()
-            except OSError:
-                pass
 
-    async def play_translation_to_blackhole(self):
-        """Write translation audio to BlackHole at 24kHz (Gemini output rate)."""
-        stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=LOCAL_SAMPLE_RATE,
-            output=True,
-            output_device_index=self._blackhole_idx,
-        )
-        try:
-            while self.running:
-                data = await self.translation_queue.get()
-                await asyncio.to_thread(stream.write, data)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            try:
-                if stream:
-                    stream.stop_stream()
-                    stream.close()
-            except OSError:
-                pass
+    def _append_translation(self, pcm_bytes):
+        """Convert Gemini PCM16 output to float32, resample to 48kHz, append to buffer."""
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32767.0
+        samples_48k = _resample(samples, GEMINI_OUTPUT_RATE, SAMPLE_RATE)
+        with self._buf_lock:
+            self._translation_buffer = np.concatenate([self._translation_buffer, samples_48k])
 
     async def monitor_audio(self):
         """Play translated audio to speakers so user can hear it."""
-        kwargs = {}
-        if self.monitor_device_index is not None:
-            kwargs["output_device_index"] = self.monitor_device_index
-        stream = await asyncio.to_thread(
-            pya.open,
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=LOCAL_SAMPLE_RATE,
-            output=True,
-            **kwargs,
+        monitor_device = self.monitor_device_index
+        stream = sd.OutputStream(
+            device=monitor_device,
+            samplerate=GEMINI_OUTPUT_RATE,
+            channels=1,
+            dtype="float32",
         )
+        stream.start()
         try:
             while self.running:
-                bytestream = await self.monitor_queue.get()
-                await asyncio.to_thread(stream.write, bytestream)
+                pcm_bytes = await self.monitor_queue.get()
+                samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32767.0
+                stream.write(samples.reshape(-1, 1))
         except asyncio.CancelledError:
             pass
         finally:
-            try:
-                if stream:
-                    stream.stop_stream()
-                    stream.close()
-            except OSError:
-                pass
+            stream.stop()
+            stream.close()
 
     async def receive_audio(self):
-        """Receive translated audio from Gemini, resample, and route."""
+        """Receive translated audio from Gemini and route it."""
         try:
             while self.translating:
                 async for response in self.session.receive():
@@ -258,12 +226,13 @@ class LiveTranslator:
                         continue
 
                     if server_content.interrupted:
-                        pass
+                        with self._buf_lock:
+                            self._translation_buffer = np.array([], dtype=np.float32)
 
                     if server_content.model_turn:
                         for part in server_content.model_turn.parts:
                             if part.inline_data:
-                                self.translation_queue.put_nowait(part.inline_data.data)
+                                self._append_translation(part.inline_data.data)
                                 if self.monitor:
                                     self.monitor_queue.put_nowait(part.inline_data.data)
 
@@ -320,9 +289,11 @@ class LiveTranslator:
         self.translating = True
         self._stop_event = asyncio.Event()
         self._loop = asyncio.get_event_loop()
-        self.gemini_queue = asyncio.Queue(maxsize=5)
-        self.translation_queue = asyncio.Queue()
+        self._translation_buffer = np.array([], dtype=np.float32)
+        self.gemini_queue = asyncio.Queue(maxsize=20)
         self.monitor_queue = asyncio.Queue()
+
+        mic_idx = sd.default.device[0]
 
         print(f"LiveTranslate")
         print(f"  Translation: {self.source_lang} -> {self.target_lang}")
@@ -333,6 +304,16 @@ class LiveTranslator:
         print(f"  In Google Meet, select '{blackhole_name}' as your microphone.")
         print(f"\n  Press Enter or type 'q' to stop.\n")
 
+        audio_stream = sd.Stream(
+            device=(mic_idx, blackhole_idx),
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCK_SIZE,
+            channels=1,
+            dtype="float32",
+            callback=self._audio_callback,
+        )
+        audio_stream.start()
+
         try:
             async with (
                 client.aio.live.connect(model=MODEL, config=config) as session,
@@ -341,8 +322,7 @@ class LiveTranslator:
                 self.session = session
 
                 quit_task = tg.create_task(self.wait_for_quit())
-                tg.create_task(self.listen_and_forward())
-                tg.create_task(self.play_translation_to_blackhole())
+                tg.create_task(self.capture_and_send())
                 tg.create_task(self.send_realtime())
                 tg.create_task(self.receive_audio())
 
@@ -357,6 +337,8 @@ class LiveTranslator:
         except ExceptionGroup as EG:
             traceback.print_exception(EG)
         finally:
+            audio_stream.stop()
+            audio_stream.close()
             self.running = False
             self.translating = False
             print("\nStopped.")
@@ -373,20 +355,29 @@ class LiveTranslator:
         self.translating = False
         self._stop_event = asyncio.Event()
         self._loop = asyncio.get_event_loop()
-        self.gemini_queue = asyncio.Queue(maxsize=5)
-        self.translation_queue = asyncio.Queue()
+        self._translation_buffer = np.array([], dtype=np.float32)
+        self.gemini_queue = asyncio.Queue(maxsize=20)
         self.monitor_queue = asyncio.Queue()
+
+        mic_idx = sd.default.device[0]
 
         print(f"LiveTranslate (forwarding only)")
         print(f"  Mic -> {blackhole_name}: active")
         print(f"  Translation: off (use Start to begin)")
 
+        self._audio_stream = sd.Stream(
+            device=(mic_idx, blackhole_idx),
+            samplerate=SAMPLE_RATE,
+            blocksize=BLOCK_SIZE,
+            channels=1,
+            dtype="float32",
+            callback=self._audio_callback,
+        )
+        self._audio_stream.start()
+
         try:
             async with asyncio.TaskGroup() as tg:
                 quit_task = tg.create_task(self.wait_for_quit())
-                tg.create_task(self.listen_and_forward())
-                tg.create_task(self.play_translation_to_blackhole())
-
                 await quit_task
                 raise asyncio.CancelledError("exit")
         except asyncio.CancelledError:
@@ -394,6 +385,8 @@ class LiveTranslator:
         except ExceptionGroup as EG:
             traceback.print_exception(EG)
         finally:
+            self._audio_stream.stop()
+            self._audio_stream.close()
             self.running = False
             print("\nStopped.")
 
@@ -407,6 +400,7 @@ class LiveTranslator:
         config = self._build_config()
 
         self._translate_stop = asyncio.Event()
+        self._translation_buffer = np.array([], dtype=np.float32)
 
         try:
             async with client.aio.live.connect(model=MODEL, config=config) as session:
@@ -415,6 +409,7 @@ class LiveTranslator:
                 print(f"\n  Translation started: {self.source_lang} -> {self.target_lang}")
 
                 async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self.capture_and_send())
                     tg.create_task(self.send_realtime())
                     tg.create_task(self.receive_audio())
 
@@ -483,8 +478,6 @@ def main():
         monitor=args.monitor,
         voice=args.voice,
     )
-
-    import threading
 
     def stdin_listener():
         try:
