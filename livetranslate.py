@@ -50,7 +50,7 @@ SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 
-MODEL = "gemini-3.1-flash-live-preview"
+MODEL = "gemini-3.5-live-translate-preview"
 
 pya = pyaudio.PyAudio()
 
@@ -107,29 +107,26 @@ class LiveTranslator:
         tgt = lang_names.get(self.target_lang, self.target_lang)
 
         system_instruction = (
-            f"You are a real-time interpreter. Listen to speech in {src} and "
-            f"immediately translate it to {tgt}. Speak ONLY the translation — "
-            f"do not add commentary, do not repeat the original, do not explain. "
-            f"Translate naturally and fluently as a professional simultaneous interpreter would. "
+            f"You are a simultaneous interpreter. Translate speech from {src} to {tgt} "
+            f"in real-time, starting to translate as soon as you understand the meaning — "
+            f"do NOT wait for the speaker to finish. Speak ONLY the translation. "
+            f"Do not add commentary, do not repeat the original, do not explain. "
+            f"Translate naturally and fluently, keeping up with the speaker's pace. "
             f"If you hear silence or non-speech sounds, remain silent."
         )
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
-            system_instruction=types.Content(
-                parts=[types.Part(text=system_instruction)]
-            ),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
                 )
             ),
+            translation_config=types.TranslationConfig(
+                target_language_code=self.target_lang,
+            ),
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
-            context_window_compression=types.ContextWindowCompressionConfig(
-                trigger_tokens=25600,
-                sliding_window=types.SlidingWindow(target_tokens=12800),
-            ),
         )
 
     async def listen_audio(self):
@@ -159,8 +156,6 @@ class LiveTranslator:
                     except asyncio.QueueFull:
                         _ = self.monitor_mic_queue.get_nowait()
                         self.monitor_mic_queue.put_nowait(data)
-                if self.model_speaking:
-                    continue
                 payload = {"data": data, "mime_type": "audio/pcm;rate=16000"}
                 try:
                     self.out_queue.put_nowait(payload)
@@ -288,9 +283,6 @@ class LiveTranslator:
 
                     if server_content.turn_complete:
                         self.model_speaking = False
-                        # Flush stale mic audio that accumulated while model was speaking
-                        while not self.out_queue.empty():
-                            self.out_queue.get_nowait()
 
                     if server_content.input_transcription:
                         print(f"\r[YOU] {server_content.input_transcription.text}", end="", flush=True)
