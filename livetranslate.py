@@ -83,9 +83,10 @@ def list_audio_devices():
 class LiveTranslator:
     VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Aoede", "Leda", "Orus", "Perseus"]
 
-    def __init__(self, source_lang="es", target_lang="en", monitor=False, monitor_device_index=None, voice="Zephyr"):
+    def __init__(self, source_lang="es", target_lang="en", mix=False, monitor=False, monitor_device_index=None, voice="Zephyr"):
         self.source_lang = source_lang
         self.target_lang = target_lang
+        self.mix = mix
         self.monitor = monitor
         self.monitor_device_index = monitor_device_index
         self.voice = voice
@@ -138,7 +139,8 @@ class LiveTranslator:
         try:
             while self.running:
                 data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
-                self.blackhole_queue.put_nowait(data)
+                if self.mix or not self.translating:
+                    self.blackhole_queue.put_nowait(data)
                 if self.translating:
                     payload = {"data": data, "mime_type": "audio/pcm;rate=24000"}
                     try:
@@ -288,9 +290,9 @@ class LiveTranslator:
         print(f"LiveTranslate")
         print(f"  Translation: {self.source_lang} -> {self.target_lang}")
         print(f"  Voice: {self.voice}")
+        print(f"  Mix (voice + translation): {'on' if self.mix else 'off (translation only)'}")
         print(f"  Output device: {blackhole_name} [index {blackhole_idx}]")
         print(f"  Monitor (speakers): {'on' if self.monitor else 'off'}")
-        print(f"\n  Mic -> BlackHole: always active")
         print(f"  In Google Meet, select '{blackhole_name}' as your microphone.")
         print(f"\n  Press Enter or type 'q' to stop.\n")
 
@@ -415,6 +417,10 @@ def main():
         help="Target language code (default: en)"
     )
     parser.add_argument(
+        "--mix", action="store_true",
+        help="Send both your voice and translation to BlackHole (default: translation only)"
+    )
+    parser.add_argument(
         "--monitor", action="store_true",
         help="Also play translated audio on your speakers (so you can hear it)"
     )
@@ -436,6 +442,7 @@ def main():
     translator = LiveTranslator(
         source_lang=args.source_lang,
         target_lang=args.target_lang,
+        mix=args.mix,
         monitor=args.monitor,
         voice=args.voice,
     )

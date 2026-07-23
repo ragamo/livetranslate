@@ -47,6 +47,7 @@ class LiveTranslateApp(rumps.App):
         self.source_lang = "es"
         self.target_lang = "en"
         self.voice = "Zephyr"
+        self.mix = False
         self.monitor = False
         self.monitor_device_index = None
         self.monitor_device_name = "Default"
@@ -84,6 +85,9 @@ class LiveTranslateApp(rumps.App):
         self.output_menu = rumps.MenuItem("Output Device")
         self._populate_output_devices()
 
+        self.mix_item = rumps.MenuItem("Mix (voice + translation)", callback=self.toggle_mix)
+        self.mix_item.state = self.mix
+
         self.monitor_item = rumps.MenuItem("Monitor (hear translation)", callback=self.toggle_monitor)
         self.monitor_item.state = self.monitor
 
@@ -96,6 +100,7 @@ class LiveTranslateApp(rumps.App):
             self.voice_menu,
             None,
             self.output_menu,
+            self.mix_item,
             self.monitor_item,
             None,
             rumps.MenuItem("Refresh Devices", callback=self.refresh_devices),
@@ -144,6 +149,12 @@ class LiveTranslateApp(rumps.App):
         for item in self.target_menu.values():
             item.state = item.title == sender.title
 
+    def toggle_mix(self, sender):
+        self.mix = not self.mix
+        sender.state = self.mix
+        if self.translator:
+            self.translator.mix = self.mix
+
     def toggle_monitor(self, sender):
         self.monitor = not self.monitor
         sender.state = self.monitor
@@ -153,6 +164,7 @@ class LiveTranslateApp(rumps.App):
         self.translator = LiveTranslator(
             source_lang=self.source_lang,
             target_lang=self.target_lang,
+            mix=self.mix,
             monitor=self.monitor,
             monitor_device_index=self.monitor_device_index,
             voice=self.voice,
@@ -185,6 +197,7 @@ class LiveTranslateApp(rumps.App):
         """Start Gemini translation session in the forwarding event loop."""
         self.translator.source_lang = self.source_lang
         self.translator.target_lang = self.target_lang
+        self.translator.mix = self.mix
         self.translator.monitor = self.monitor
         self.translator.monitor_device_index = self.monitor_device_index
         self.translator.voice = self.voice
