@@ -4,6 +4,8 @@ Real-time audio translation for Google Meet using Gemini Live Translate API.
 
 Your microphone always forwards to a virtual audio device (BlackHole). When translation is active, the translated audio is mixed in. By default only translation goes to Meet; with `--mix`, participants hear your original voice plus the translation. Use it from the command line or the macOS menu bar app.
 
+![Menu Bar App](assets/menubar.png)
+
 ## Requirements
 
 - macOS
